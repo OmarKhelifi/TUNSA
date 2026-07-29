@@ -1,0 +1,163 @@
+---
+name: Test SSH des émulateurs
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-ssh:
+    name: SSH - ${{ matrix.node }}
+    runs-on:
+      - self-hosted
+      - Linux
+      - X64
+      - tunsa-qemu
+
+    timeout-minutes: 5
+
+    strategy:
+      fail-fast: false
+
+      matrix:
+        include:
+          - node: raspberry-pi-01
+            host: 10.50.0.11
+            user: omar
+
+          - node: raspberry-pi-02
+            host: 10.50.0.12
+            user: omar2
+
+    steps:
+      - name: Afficher la machine cible
+        env:
+          NODE_NAME: ${{ matrix.node }}
+          TARGET_HOST: ${{ matrix.host }}
+          TARGET_USER: ${{ matrix.user }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "Nœud        : ${NODE_NAME}"
+          echo "Adresse IP  : ${TARGET_HOST}"
+          echo "Utilisateur : ${TARGET_USER}"
+          echo "Runner      : $(hostname)"
+
+      - name: Vérifier la route réseau
+        env:
+          TARGET_HOST: ${{ matrix.host }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "Route vers ${TARGET_HOST} :"
+          ip route get "${TARGET_HOST}"
+
+      - name: Vérifier que le port SSH répond
+        env:
+          TARGET_HOST: ${{ matrix.host }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          timeout 10 bash -c \
+            "exec 3<>/dev/tcp/${TARGET_HOST}/22"
+
+          echo "Le port SSH 22 répond sur ${TARGET_HOST}."
+
+      - name: Vérifier les fichiers SSH du runner
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          SSH_KEY="/home/omar/.ssh/tunsa_ansible"
+          KNOWN_HOSTS="/home/omar/.ssh/known_hosts"
+
+          if [[ ! -r "${SSH_KEY}" ]]; then
+            echo "Clé SSH absente ou illisible : ${SSH_KEY}" >&2
+            exit 1
+          fi
+
+          if [[ ! -r "${KNOWN_HOSTS}" ]]; then
+            echo "Fichier known_hosts absent : ${KNOWN_HOSTS}" >&2
+            exit 1
+          fi
+
+          echo "Les fichiers SSH nécessaires sont disponibles."
+
+      - name: Vérifier la clé d'hôte enregistrée
+        env:
+          TARGET_HOST: ${{ matrix.host }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          KNOWN_HOSTS="/home/omar/.ssh/known_hosts"
+
+          if ! ssh-keygen \
+            -F "${TARGET_HOST}" \
+            -f "${KNOWN_HOSTS}" >/dev/null; then
+
+            echo "Aucune clé SSH enregistrée pour ${TARGET_HOST}." >&2
+            echo "Connecte-toi manuellement une première fois à cette VM." >&2
+            exit 1
+          fi
+
+          echo "Clé d'hôte trouvée pour ${TARGET_HOST}."
+
+      - name: Tester la connexion SSH
+        env:
+          EXPECTED_HOSTNAME: ${{ matrix.node }}
+          TARGET_HOST: ${{ matrix.host }}
+          TARGET_USER: ${{ matrix.user }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          SSH_KEY="/home/omar/.ssh/tunsa_ansible"
+          KNOWN_HOSTS="/home/omar/.ssh/known_hosts"
+
+          ssh \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o ConnectTimeout=10 \
+            -o ConnectionAttempts=2 \
+            -o StrictHostKeyChecking=yes \
+            -o "UserKnownHostsFile=${KNOWN_HOSTS}" \
+            -i "${SSH_KEY}" \
+            "${TARGET_USER}@${TARGET_HOST}" \
+            bash -s -- "${EXPECTED_HOSTNAME}" <<'REMOTE_SCRIPT'
+          set -Eeuo pipefail
+
+          expected_hostname="$1"
+          actual_hostname="$(hostname)"
+          actual_user="$(whoami)"
+          actual_architecture="$(uname -m)"
+          ssh_status="$(systemctl is-active ssh)"
+
+          if [[ "${actual_hostname}" != "${expected_hostname}" ]]; then
+            echo "Hostname incorrect." >&2
+            echo "Attendu : ${expected_hostname}" >&2
+            echo "Obtenu  : ${actual_hostname}" >&2
+            exit 1
+          fi
+
+          if [[ "${actual_architecture}" != "aarch64" ]]; then
+            echo "Architecture incorrecte : ${actual_architecture}" >&2
+            exit 1
+          fi
+
+          if [[ "${ssh_status}" != "active" ]]; then
+            echo "Le service SSH n'est pas actif : ${ssh_status}" >&2
+            exit 1
+          fi
+
+          echo "SSH_OK"
+          echo "Hostname     : ${actual_hostname}"
+          echo "Utilisateur  : ${actual_user}"
+          echo "Architecture : ${actual_architecture}"
+          echo "Service SSH  : ${ssh_status}"
+          REMOTE_SCRIPT
