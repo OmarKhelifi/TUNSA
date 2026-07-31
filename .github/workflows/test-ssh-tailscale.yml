@@ -43,22 +43,26 @@ jobs:
           ip rule show
           ip route show table 52 || true
 
-      - name: Préparer et valider SSH
+      - name: Préparer SSH et charger la clé chiffrée
         shell: bash
         env:
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
           SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
         run: |
           set -Eeuo pipefail
 
           private_key="${SSH_PRIVATE_KEY:-}"
+          passphrase="${SSH_KEY_PASSPHRASE:-}"
           known_hosts="${SSH_KNOWN_HOSTS:-}"
-
-          echo "SSH_PRIVATE_KEY : ${#private_key} caractères"
-          echo "SSH_KNOWN_HOSTS : ${#known_hosts} caractères"
 
           [[ -n "${private_key}" ]] || {
             echo "SSH_PRIVATE_KEY est absent ou vide." >&2
+            exit 1
+          }
+
+          [[ -n "${passphrase}" ]] || {
+            echo "SSH_KEY_PASSPHRASE est absent ou vide." >&2
             exit 1
           }
 
@@ -69,53 +73,81 @@ jobs:
 
           install -d -m 700 "${HOME}/.ssh"
 
-          # Supprimer les caractères CR qui peuvent venir d'un copier-coller.
           printf '%s\n' "${private_key}" |
-            tr -d '\r' \
-            > "${HOME}/.ssh/tunsa_ansible"
+            tr -d '\r' > "${HOME}/.ssh/tunsa_ansible"
 
           printf '%s\n' "${known_hosts}" |
-            tr -d '\r' \
-            > "${HOME}/.ssh/known_hosts"
+            tr -d '\r' > "${HOME}/.ssh/known_hosts"
 
           chmod 600 \
             "${HOME}/.ssh/tunsa_ansible" \
             "${HOME}/.ssh/known_hosts"
 
-          echo "Validation de la clé privée SSH..."
+          # Démarrer l'agent SSH.
+          eval "$(ssh-agent -s)"
 
-          if ! ssh-keygen \
-            -y \
-            -f "${HOME}/.ssh/tunsa_ansible" \
-            > "${RUNNER_TEMP}/tunsa-public.key"; then
+          # Rendre l'agent disponible aux étapes suivantes.
+          echo "SSH_AUTH_SOCK=${SSH_AUTH_SOCK}" >> "${GITHUB_ENV}"
+          echo "SSH_AGENT_PID=${SSH_AGENT_PID}" >> "${GITHUB_ENV}"
 
-            echo "SSH_PRIVATE_KEY n'est pas une clé privée valide." >&2
-            echo "Vérifie le contenu du secret GitHub SSH_PRIVATE_KEY." >&2
-            exit 1
-          fi
+          # Script temporaire utilisé par ssh-add pour lire la passphrase.
+          askpass_script="${RUNNER_TEMP}/ssh-askpass.sh"
 
-          echo "Clé privée valide."
-          echo "Empreinte de la clé utilisée par GitHub Actions :"
+          cat > "${askpass_script}" <<'ASKPASS'
+          #!/usr/bin/env bash
+          printf '%s\n' "${SSH_KEY_PASSPHRASE}"
+          ASKPASS
 
-          ssh-keygen \
-            -lf "${RUNNER_TEMP}/tunsa-public.key"
+          chmod 700 "${askpass_script}"
+
+          echo "Chargement de la clé dans ssh-agent..."
+
+          DISPLAY=:0 \
+          SSH_ASKPASS="${askpass_script}" \
+          SSH_ASKPASS_REQUIRE=force \
+          setsid -w ssh-add "${HOME}/.ssh/tunsa_ansible" </dev/null
+
+          rm -f "${askpass_script}"
+
+          echo "Clé chargée dans ssh-agent :"
+          ssh-add -l
+
+          echo "Empreinte de la clé :"
+          ssh-add -L |
+            ssh-keygen -lf -
 
           for host in 10.50.0.11 10.50.0.12; do
-            if ssh-keygen \
-                 -F "${host}" \
-                 -f "${HOME}/.ssh/known_hosts" >/dev/null; then
+            ssh-keygen \
+              -F "${host}" \
+              -f "${HOME}/.ssh/known_hosts" >/dev/null || {
+                echo "Clé d'hôte absente pour ${host}" >&2
+                exit 1
+              }
 
-              echo "${host} : clé d'hôte présente"
-            else
-              echo "${host} : clé d'hôte absente dans SSH_KNOWN_HOSTS" >&2
-              exit 1
-            fi
+            echo "${host} : clé d'hôte présente"
           done
-
+          
       - name: Tester les deux émulateurs par SSH
         shell: bash
         run: |
           set -Eeuo pipefail
+
+          echo "Vérification de ssh-agent..."
+
+          [[ -n "${SSH_AUTH_SOCK:-}" ]] || {
+            echo "SSH_AUTH_SOCK est absent." >&2
+            exit 1
+          }
+
+          [[ -S "${SSH_AUTH_SOCK}" ]] || {
+            echo "Socket ssh-agent introuvable : ${SSH_AUTH_SOCK}" >&2
+            exit 1
+          }
+
+          ssh-add -l || {
+            echo "Aucune clé disponible dans ssh-agent." >&2
+            exit 1
+          }
 
           wait_for_ssh() {
             local host="$1"
@@ -155,6 +187,7 @@ jobs:
             ssh \
               -o BatchMode=yes \
               -o IdentitiesOnly=yes \
+              -o "IdentityAgent=${SSH_AUTH_SOCK}" \
               -o ConnectTimeout=10 \
               -o ConnectionAttempts=2 \
               -o StrictHostKeyChecking=yes \
@@ -213,3 +246,22 @@ jobs:
             "omar2" \
             "raspberry-pi-02" \
             "omar2"
+
+
+      - name: Nettoyer SSH
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          if [[ -n "${SSH_AGENT_PID:-}" ]]; then
+            echo "Arrêt de ssh-agent..."
+            ssh-agent -k >/dev/null 2>&1 || true
+          else
+            echo "Aucun ssh-agent à arrêter."
+          fi
+
+          rm -f \
+            "${HOME}/.ssh/tunsa_ansible" \
+            "${HOME}/.ssh/known_hosts" \
+            "${RUNNER_TEMP}/ssh-askpass.sh"
