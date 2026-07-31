@@ -43,7 +43,7 @@ jobs:
           ip rule show
           ip route show table 52 || true
 
-      - name: Préparer SSH
+      - name: Préparer et valider SSH
         shell: bash
         env:
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
@@ -51,27 +51,66 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          [[ -n "${SSH_PRIVATE_KEY}" ]] || {
-            echo "Le secret SSH_PRIVATE_KEY est absent." >&2
+          private_key="${SSH_PRIVATE_KEY:-}"
+          known_hosts="${SSH_KNOWN_HOSTS:-}"
+
+          echo "SSH_PRIVATE_KEY : ${#private_key} caractères"
+          echo "SSH_KNOWN_HOSTS : ${#known_hosts} caractères"
+
+          [[ -n "${private_key}" ]] || {
+            echo "SSH_PRIVATE_KEY est absent ou vide." >&2
             exit 1
           }
 
-          [[ -n "${SSH_KNOWN_HOSTS}" ]] || {
-            echo "Le secret SSH_KNOWN_HOSTS est absent." >&2
+          [[ -n "${known_hosts}" ]] || {
+            echo "SSH_KNOWN_HOSTS est absent ou vide." >&2
             exit 1
           }
 
           install -d -m 700 "${HOME}/.ssh"
 
-          printf '%s\n' "${SSH_PRIVATE_KEY}" \
+          # Supprimer les caractères CR qui peuvent venir d'un copier-coller.
+          printf '%s\n' "${private_key}" |
+            tr -d '\r' \
             > "${HOME}/.ssh/tunsa_ansible"
 
-          printf '%s\n' "${SSH_KNOWN_HOSTS}" \
+          printf '%s\n' "${known_hosts}" |
+            tr -d '\r' \
             > "${HOME}/.ssh/known_hosts"
 
           chmod 600 \
             "${HOME}/.ssh/tunsa_ansible" \
             "${HOME}/.ssh/known_hosts"
+
+          echo "Validation de la clé privée SSH..."
+
+          if ! ssh-keygen \
+            -y \
+            -f "${HOME}/.ssh/tunsa_ansible" \
+            > "${RUNNER_TEMP}/tunsa-public.key"; then
+
+            echo "SSH_PRIVATE_KEY n'est pas une clé privée valide." >&2
+            echo "Vérifie le contenu du secret GitHub SSH_PRIVATE_KEY." >&2
+            exit 1
+          fi
+
+          echo "Clé privée valide."
+          echo "Empreinte de la clé utilisée par GitHub Actions :"
+
+          ssh-keygen \
+            -lf "${RUNNER_TEMP}/tunsa-public.key"
+
+          for host in 10.50.0.11 10.50.0.12; do
+            if ssh-keygen \
+                 -F "${host}" \
+                 -f "${HOME}/.ssh/known_hosts" >/dev/null; then
+
+              echo "${host} : clé d'hôte présente"
+            else
+              echo "${host} : clé d'hôte absente dans SSH_KNOWN_HOSTS" >&2
+              exit 1
+            fi
+          done
 
       - name: Tester les deux émulateurs par SSH
         shell: bash
