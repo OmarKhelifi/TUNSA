@@ -1,0 +1,177 @@
+---
+name: Test SSH via Tailscale
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tunsa-tailscale-ssh
+  cancel-in-progress: false
+
+jobs:
+  test-ssh:
+    name: SSH via GitHub-hosted runner
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 10
+
+    steps:
+      - name: Connecter le runner à Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          args: --accept-routes
+
+      - name: Afficher l'état Tailscale
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "Adresse Tailscale du runner :"
+          tailscale ip -4
+
+          echo
+          echo "État du tailnet :"
+          tailscale status
+
+          echo
+          echo "Routes Tailscale :"
+          ip rule show
+          ip route show table 52 || true
+
+      - name: Préparer SSH
+        shell: bash
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+        run: |
+          set -Eeuo pipefail
+
+          [[ -n "${SSH_PRIVATE_KEY}" ]] || {
+            echo "Le secret SSH_PRIVATE_KEY est absent." >&2
+            exit 1
+          }
+
+          [[ -n "${SSH_KNOWN_HOSTS}" ]] || {
+            echo "Le secret SSH_KNOWN_HOSTS est absent." >&2
+            exit 1
+          }
+
+          install -d -m 700 "${HOME}/.ssh"
+
+          printf '%s\n' "${SSH_PRIVATE_KEY}" \
+            > "${HOME}/.ssh/tunsa_ansible"
+
+          printf '%s\n' "${SSH_KNOWN_HOSTS}" \
+            > "${HOME}/.ssh/known_hosts"
+
+          chmod 600 \
+            "${HOME}/.ssh/tunsa_ansible" \
+            "${HOME}/.ssh/known_hosts"
+
+      - name: Tester les deux émulateurs par SSH
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          wait_for_ssh() {
+            local host="$1"
+            local attempt
+
+            for attempt in $(seq 1 12); do
+              echo "Tentative ${attempt}/12 vers ${host}:22..."
+
+              if timeout 4 bash -c \
+                "exec 3<>/dev/tcp/${host}/22" 2>/dev/null; then
+                echo "Le port SSH répond sur ${host}."
+                return 0
+              fi
+
+              sleep 5
+            done
+
+            echo "Le port SSH ne répond pas sur ${host}." >&2
+            return 1
+          }
+
+          test_node() {
+            local host="$1"
+            local user="$2"
+            local expected_hostname="$3"
+            local expected_user="$4"
+
+            echo
+            echo "========================================"
+            echo "Test de ${expected_hostname}"
+            echo "Adresse : ${host}"
+            echo "Compte  : ${user}"
+            echo "========================================"
+
+            wait_for_ssh "${host}"
+
+            ssh \
+              -o BatchMode=yes \
+              -o IdentitiesOnly=yes \
+              -o ConnectTimeout=10 \
+              -o ConnectionAttempts=2 \
+              -o StrictHostKeyChecking=yes \
+              -o UserKnownHostsFile="${HOME}/.ssh/known_hosts" \
+              -i "${HOME}/.ssh/tunsa_ansible" \
+              "${user}@${host}" \
+              bash -s -- \
+              "${expected_hostname}" \
+              "${expected_user}" <<'REMOTE_SCRIPT'
+          set -Eeuo pipefail
+
+          expected_hostname="$1"
+          expected_user="$2"
+
+          actual_hostname="$(hostname)"
+          actual_user="$(whoami)"
+          actual_architecture="$(uname -m)"
+          ssh_status="$(systemctl is-active ssh)"
+
+          [[ "${actual_hostname}" == "${expected_hostname}" ]] || {
+            echo "Hostname incorrect : ${actual_hostname}" >&2
+            exit 1
+          }
+
+          [[ "${actual_user}" == "${expected_user}" ]] || {
+            echo "Utilisateur incorrect : ${actual_user}" >&2
+            exit 1
+          }
+
+          [[ "${actual_architecture}" == "aarch64" ]] || {
+            echo "Architecture incorrecte : ${actual_architecture}" >&2
+            exit 1
+          }
+
+          [[ "${ssh_status}" == "active" ]] || {
+            echo "Service SSH non actif : ${ssh_status}" >&2
+            exit 1
+          }
+
+          echo "SSH_OK"
+          echo "Hostname     : ${actual_hostname}"
+          echo "Utilisateur  : ${actual_user}"
+          echo "Architecture : ${actual_architecture}"
+          echo "Service SSH  : ${ssh_status}"
+          REMOTE_SCRIPT
+          }
+
+          test_node \
+            "10.50.0.11" \
+            "omar" \
+            "raspberry-pi-01" \
+            "omar"
+
+          test_node \
+            "10.50.0.12" \
+            "omar2" \
+            "raspberry-pi-02" \
+            "omar2"
