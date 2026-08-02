@@ -1,5 +1,5 @@
 ---
-name: Test SSH via Tailscale
+name: Test SSH et déploiement Ansible via Tailscale
 
 on:
   workflow_dispatch:
@@ -8,17 +8,41 @@ permissions:
   contents: read
 
 concurrency:
-  group: tunsa-tailscale-ssh
+  group: tunsa-tailscale-ansible
   cancel-in-progress: false
 
 jobs:
-  test-ssh:
-    name: SSH via GitHub-hosted runner
+  test-and-configure:
+    name: SSH et Ansible via GitHub-hosted runner
     runs-on: ubuntu-latest
 
-    timeout-minutes: 10
+    # L'installation d'Ansible et apt sur les VM ARM64 peut être lente.
+    timeout-minutes: 30
 
     steps:
+      - name: Récupérer le dépôt
+        uses: actions/checkout@v4
+
+      - name: Vérifier les fichiers Ansible du dépôt
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          test -f ansible/inventory.ini || {
+            echo "Fichier absent : ansible/inventory.ini" >&2
+            exit 1
+          }
+
+          test -f ansible/playbooks/install-package.yml || {
+            echo "Fichier absent : ansible/playbooks/install-package.yml" >&2
+            exit 1
+          }
+
+          echo "Fichiers Ansible trouvés :"
+          printf '%s\n' \
+            "ansible/inventory.ini" \
+            "ansible/playbooks/install-package.yml"
+
       - name: Connecter le runner à Tailscale
         uses: tailscale/github-action@v4
         with:
@@ -42,6 +66,11 @@ jobs:
           echo "Routes Tailscale :"
           ip rule show
           ip route show table 52 || true
+
+          echo
+          echo "Route vers les émulateurs :"
+          ip route get 10.50.0.11
+          ip route get 10.50.0.12
 
       - name: Préparer SSH et charger la clé chiffrée
         shell: bash
@@ -126,7 +155,7 @@ jobs:
 
             echo "${host} : clé d'hôte présente"
           done
-          
+
       - name: Tester les deux émulateurs par SSH
         shell: bash
         run: |
@@ -247,6 +276,94 @@ jobs:
             "raspberry-pi-02" \
             "omar2"
 
+      - name: Installer Ansible sur le runner
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y ansible
+
+          echo "Version Ansible :"
+          ansible --version
+
+      - name: Vérifier l'inventaire et le playbook Ansible
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "Structure de l'inventaire :"
+          ansible-inventory \
+            -i ansible/inventory.ini \
+            --graph
+
+          echo
+          echo "Vérification syntaxique du playbook :"
+          ansible-playbook \
+            -i ansible/inventory.ini \
+            ansible/playbooks/install-package.yml \
+            --syntax-check
+
+      - name: Vérifier ssh-agent pour Ansible
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          [[ -n "${SSH_AUTH_SOCK:-}" ]] || {
+            echo "SSH_AUTH_SOCK est absent." >&2
+            exit 1
+          }
+
+          [[ -S "${SSH_AUTH_SOCK}" ]] || {
+            echo "Socket ssh-agent introuvable : ${SSH_AUTH_SOCK}" >&2
+            exit 1
+          }
+
+          echo "Clé disponible dans ssh-agent :"
+          ssh-add -l
+
+      - name: Tester la connexion Ansible
+        shell: bash
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "True"
+          ANSIBLE_FORCE_COLOR: "True"
+        run: |
+          set -Eeuo pipefail
+
+          ansible \
+            raspberry_nodes \
+            -i ansible/inventory.ini \
+            --private-key "${HOME}/.ssh/tunsa_ansible" \
+            -m ansible.builtin.ping
+
+      - name: Vérifier les permissions sudo
+        shell: bash
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "True"
+          ANSIBLE_FORCE_COLOR: "True"
+        run: |
+          set -Eeuo pipefail
+
+          ansible \
+            raspberry_nodes \
+            -i ansible/inventory.ini \
+            --private-key "${HOME}/.ssh/tunsa_ansible" \
+            -m ansible.builtin.command \
+            -a "sudo -n id -u"
+
+      - name: Installer htop avec Ansible
+        shell: bash
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "True"
+          ANSIBLE_FORCE_COLOR: "True"
+        run: |
+          set -Eeuo pipefail
+
+          ansible-playbook \
+            -i ansible/inventory.ini \
+            --private-key "${HOME}/.ssh/tunsa_ansible" \
+            ansible/playbooks/install-package.yml \
+            --extra-vars "package_to_install=htop"
 
       - name: Nettoyer SSH
         if: always()

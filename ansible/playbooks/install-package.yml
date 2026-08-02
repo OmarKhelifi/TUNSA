@@ -1,0 +1,34 @@
+---
+- name: Installer un paquet sur les émulateurs TUNSA
+  hosts: raspberry_nodes
+  become: true
+  gather_facts: true
+
+  vars:
+    package_to_install: htop
+
+  tasks:
+    - name: Mettre à jour le cache APT
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Installer le paquet demandé
+      ansible.builtin.apt:
+        name: "{{ package_to_install }}"
+        state: present
+
+    - name: Récupérer les paquets installés
+      ansible.builtin.package_facts:
+        manager: auto
+
+    - name: Vérifier que le paquet est installé
+      ansible.builtin.assert:
+        that:
+          - package_to_install in ansible_facts.packages
+        success_msg: >-
+          {{ package_to_install }} est installé sur
+          {{ inventory_hostname }}.
+        fail_msg: >-
+          {{ package_to_install }} n'est pas installé sur
+          {{ inventory_hostname }}.
