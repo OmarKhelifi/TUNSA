@@ -1,0 +1,133 @@
+---
+name: Préparer l'accès TUNSA
+description: Connecte le runner à Tailscale et charge la clé SSH chiffrée.
+
+inputs:
+  tailscale_client_id:
+    description: Identifiant OAuth Tailscale
+    required: true
+  tailscale_oauth_secret:
+    description: Secret OAuth Tailscale
+    required: true
+  ssh_private_key:
+    description: Clé privée SSH chiffrée
+    required: true
+  ssh_key_passphrase:
+    description: Passphrase de la clé privée SSH
+    required: true
+  ssh_known_hosts:
+    description: Entrées known_hosts des deux émulateurs
+    required: true
+  node_1_ip:
+    description: Adresse IP du premier émulateur
+    required: true
+  node_2_ip:
+    description: Adresse IP du deuxième émulateur
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Connecter le runner à Tailscale
+      uses: tailscale/github-action@v4
+      with:
+        oauth-client-id: ${{ inputs.tailscale_client_id }}
+        oauth-secret: ${{ inputs.tailscale_oauth_secret }}
+        tags: tag:ci
+
+    - name: Vérifier les routes Tailscale
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+
+        echo "Adresse Tailscale du runner :"
+        tailscale ip -4
+
+        echo
+        echo "État du tailnet :"
+        tailscale status
+
+        echo
+        echo "Route vers le premier émulateur :"
+        ip route get "${{ inputs.node_1_ip }}"
+
+        echo
+        echo "Route vers le deuxième émulateur :"
+        ip route get "${{ inputs.node_2_ip }}"
+
+    - name: Préparer SSH et charger la clé chiffrée
+      shell: bash
+      env:
+        SSH_PRIVATE_KEY: ${{ inputs.ssh_private_key }}
+        SSH_KEY_PASSPHRASE: ${{ inputs.ssh_key_passphrase }}
+        SSH_KNOWN_HOSTS: ${{ inputs.ssh_known_hosts }}
+        NODE_1_IP: ${{ inputs.node_1_ip }}
+        NODE_2_IP: ${{ inputs.node_2_ip }}
+      run: |
+        set -Eeuo pipefail
+
+        private_key="${SSH_PRIVATE_KEY:-}"
+        passphrase="${SSH_KEY_PASSPHRASE:-}"
+        known_hosts="${SSH_KNOWN_HOSTS:-}"
+
+        [[ -n "${private_key}" ]] || {
+          echo "SSH_PRIVATE_KEY est absent ou vide." >&2
+          exit 1
+        }
+
+        [[ -n "${passphrase}" ]] || {
+          echo "SSH_KEY_PASSPHRASE est absent ou vide." >&2
+          exit 1
+        }
+
+        [[ -n "${known_hosts}" ]] || {
+          echo "SSH_KNOWN_HOSTS est absent ou vide." >&2
+          exit 1
+        }
+
+        install -d -m 700 "${HOME}/.ssh"
+
+        printf '%s\n' "${private_key}" |
+          tr -d '\r' > "${HOME}/.ssh/tunsa_ansible"
+
+        printf '%s\n' "${known_hosts}" |
+          tr -d '\r' > "${HOME}/.ssh/known_hosts"
+
+        chmod 600 \
+          "${HOME}/.ssh/tunsa_ansible" \
+          "${HOME}/.ssh/known_hosts"
+
+        eval "$(ssh-agent -s)"
+
+        echo "SSH_AUTH_SOCK=${SSH_AUTH_SOCK}" >> "${GITHUB_ENV}"
+        echo "SSH_AGENT_PID=${SSH_AGENT_PID}" >> "${GITHUB_ENV}"
+
+        askpass_script="${RUNNER_TEMP}/ssh-askpass.sh"
+
+        cat > "${askpass_script}" <<'ASKPASS'
+        #!/usr/bin/env bash
+        printf '%s\n' "${SSH_KEY_PASSPHRASE}"
+        ASKPASS
+
+        chmod 700 "${askpass_script}"
+
+        DISPLAY=:0 \
+        SSH_ASKPASS="${askpass_script}" \
+        SSH_ASKPASS_REQUIRE=force \
+        setsid -w ssh-add "${HOME}/.ssh/tunsa_ansible" </dev/null
+
+        rm -f "${askpass_script}"
+
+        echo "Clé chargée dans ssh-agent :"
+        ssh-add -l
+
+        for host in "${NODE_1_IP}" "${NODE_2_IP}"; do
+          if ssh-keygen \
+               -F "${host}" \
+               -f "${HOME}/.ssh/known_hosts" >/dev/null; then
+            echo "${host} : clé d'hôte présente"
+          else
+            echo "Clé d'hôte absente pour ${host}." >&2
+            exit 1
+          fi
+        done

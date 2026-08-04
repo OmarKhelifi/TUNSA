@@ -1,8 +1,14 @@
 ---
-name: Test SSH et déploiement Ansible via Tailscale
+name: Pipeline TUNSA — SSH et Ansible via Tailscale
 
 on:
   workflow_dispatch:
+    inputs:
+      package_name:
+        description: Paquet à installer avec Ansible
+        required: true
+        default: htop
+        type: string
 
 permissions:
   contents: read
@@ -11,157 +17,93 @@ concurrency:
   group: tunsa-tailscale-ansible
   cancel-in-progress: false
 
-jobs:
-  test-and-configure:
-    name: SSH et Ansible via GitHub-hosted runner
-    runs-on: ubuntu-latest
+env:
+  ANSIBLE_INVENTORY: ansible/inventory.ini
+  ANSIBLE_PLAYBOOK: ansible/playbooks/install-package.yml
+  NODE_1_IP: 10.50.0.11
+  NODE_2_IP: 10.50.0.12
 
-    # L'installation d'Ansible et apt sur les VM ARM64 peut être lente.
-    timeout-minutes: 30
+jobs:
+  # ---------------------------------------------------------------------------
+  # STAGE 1 — Validation statique
+  # ---------------------------------------------------------------------------
+  validate-ansible:
+    name: 1 — Valider Ansible
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Récupérer le dépôt
         uses: actions/checkout@v4
 
-      - name: Vérifier les fichiers Ansible du dépôt
+      - name: Vérifier les fichiers requis
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          test -f ansible/inventory.ini || {
-            echo "Fichier absent : ansible/inventory.ini" >&2
-            exit 1
-          }
+          for file in "${ANSIBLE_INVENTORY}" "${ANSIBLE_PLAYBOOK}"; do
+            [[ -f "${file}" ]] || {
+              echo "Fichier absent : ${file}" >&2
+              exit 1
+            }
 
-          test -f ansible/playbooks/install-package.yml || {
-            echo "Fichier absent : ansible/playbooks/install-package.yml" >&2
-            exit 1
-          }
-
-          echo "Fichiers Ansible trouvés :"
-          printf '%s\n' \
-            "ansible/inventory.ini" \
-            "ansible/playbooks/install-package.yml"
-
-      - name: Connecter le runner à Tailscale
-        uses: tailscale/github-action@v4
-        with:
-          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
-          tags: tag:ci
-
-      - name: Afficher l'état Tailscale
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          echo "Adresse Tailscale du runner :"
-          tailscale ip -4
-
-          echo
-          echo "État du tailnet :"
-          tailscale status
-
-          echo
-          echo "Routes Tailscale :"
-          ip rule show
-          ip route show table 52 || true
-
-          echo
-          echo "Route vers les émulateurs :"
-          ip route get 10.50.0.11
-          ip route get 10.50.0.12
-
-      - name: Préparer SSH et charger la clé chiffrée
-        shell: bash
-        env:
-          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-          SSH_KEY_PASSPHRASE: ${{ secrets.SSH_KEY_PASSPHRASE }}
-          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
-        run: |
-          set -Eeuo pipefail
-
-          private_key="${SSH_PRIVATE_KEY:-}"
-          passphrase="${SSH_KEY_PASSPHRASE:-}"
-          known_hosts="${SSH_KNOWN_HOSTS:-}"
-
-          [[ -n "${private_key}" ]] || {
-            echo "SSH_PRIVATE_KEY est absent ou vide." >&2
-            exit 1
-          }
-
-          [[ -n "${passphrase}" ]] || {
-            echo "SSH_KEY_PASSPHRASE est absent ou vide." >&2
-            exit 1
-          }
-
-          [[ -n "${known_hosts}" ]] || {
-            echo "SSH_KNOWN_HOSTS est absent ou vide." >&2
-            exit 1
-          }
-
-          install -d -m 700 "${HOME}/.ssh"
-
-          printf '%s\n' "${private_key}" |
-            tr -d '\r' > "${HOME}/.ssh/tunsa_ansible"
-
-          printf '%s\n' "${known_hosts}" |
-            tr -d '\r' > "${HOME}/.ssh/known_hosts"
-
-          chmod 600 \
-            "${HOME}/.ssh/tunsa_ansible" \
-            "${HOME}/.ssh/known_hosts"
-
-          # Démarrer l'agent SSH.
-          eval "$(ssh-agent -s)"
-
-          # Rendre l'agent disponible aux étapes suivantes.
-          echo "SSH_AUTH_SOCK=${SSH_AUTH_SOCK}" >> "${GITHUB_ENV}"
-          echo "SSH_AGENT_PID=${SSH_AGENT_PID}" >> "${GITHUB_ENV}"
-
-          # Script temporaire utilisé par ssh-add pour lire la passphrase.
-          askpass_script="${RUNNER_TEMP}/ssh-askpass.sh"
-
-          cat > "${askpass_script}" <<'ASKPASS'
-          #!/usr/bin/env bash
-          printf '%s\n' "${SSH_KEY_PASSPHRASE}"
-          ASKPASS
-
-          chmod 700 "${askpass_script}"
-
-          echo "Chargement de la clé dans ssh-agent..."
-
-          DISPLAY=:0 \
-          SSH_ASKPASS="${askpass_script}" \
-          SSH_ASKPASS_REQUIRE=force \
-          setsid -w ssh-add "${HOME}/.ssh/tunsa_ansible" </dev/null
-
-          rm -f "${askpass_script}"
-
-          echo "Clé chargée dans ssh-agent :"
-          ssh-add -l
-
-          echo "Empreinte de la clé :"
-          ssh-add -L |
-            ssh-keygen -lf -
-
-          for host in 10.50.0.11 10.50.0.12; do
-            ssh-keygen \
-              -F "${host}" \
-              -f "${HOME}/.ssh/known_hosts" >/dev/null || {
-                echo "Clé d'hôte absente pour ${host}" >&2
-                exit 1
-              }
-
-            echo "${host} : clé d'hôte présente"
+            echo "Fichier trouvé : ${file}"
           done
+
+      - name: Installer Ansible pour la validation
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y ansible
+          ansible --version
+
+      - name: Valider l'inventaire et le playbook
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "Structure de l'inventaire :"
+          ansible-inventory \
+            -i "${ANSIBLE_INVENTORY}" \
+            --graph
+
+          echo
+          echo "Vérification syntaxique du playbook :"
+          ansible-playbook \
+            -i "${ANSIBLE_INVENTORY}" \
+            "${ANSIBLE_PLAYBOOK}" \
+            --syntax-check
+
+  # ---------------------------------------------------------------------------
+  # STAGE 2 — Test de la connectivité et de SSH
+  # ---------------------------------------------------------------------------
+  test-ssh:
+    name: 2 — Tester SSH
+    needs: validate-ansible
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Récupérer le dépôt
+        uses: actions/checkout@v4
+
+      - name: Préparer l'accès TUNSA
+        uses: ./.github/actions/setup-tunsa-access
+        with:
+          tailscale_client_id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          tailscale_oauth_secret: ${{ secrets.TS_OAUTH_SECRET }}
+          ssh_private_key: ${{ secrets.SSH_PRIVATE_KEY }}
+          ssh_key_passphrase: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          ssh_known_hosts: ${{ secrets.SSH_KNOWN_HOSTS }}
+          node_1_ip: ${{ env.NODE_1_IP }}
+          node_2_ip: ${{ env.NODE_2_IP }}
 
       - name: Tester les deux émulateurs par SSH
         shell: bash
         run: |
           set -Eeuo pipefail
-
-          echo "Vérification de ssh-agent..."
 
           [[ -n "${SSH_AUTH_SOCK:-}" ]] || {
             echo "SSH_AUTH_SOCK est absent." >&2
@@ -173,10 +115,7 @@ jobs:
             exit 1
           }
 
-          ssh-add -l || {
-            echo "Aucune clé disponible dans ssh-agent." >&2
-            exit 1
-          }
+          ssh-add -l
 
           wait_for_ssh() {
             local host="$1"
@@ -265,16 +204,44 @@ jobs:
           }
 
           test_node \
-            "10.50.0.11" \
+            "${NODE_1_IP}" \
             "omar" \
             "raspberry-pi-01" \
             "omar"
 
           test_node \
-            "10.50.0.12" \
+            "${NODE_2_IP}" \
             "omar2" \
             "raspberry-pi-02" \
             "omar2"
+
+      - name: Nettoyer SSH
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          if [[ -n "${SSH_AGENT_PID:-}" ]]; then
+            ssh-agent -k >/dev/null 2>&1 || true
+          fi
+
+          rm -f \
+            "${HOME}/.ssh/tunsa_ansible" \
+            "${HOME}/.ssh/known_hosts" \
+            "${RUNNER_TEMP}/ssh-askpass.sh"
+
+  # ---------------------------------------------------------------------------
+  # STAGE 3 — Déploiement avec Ansible
+  # ---------------------------------------------------------------------------
+  deploy-ansible:
+    name: 3 — Déployer avec Ansible
+    needs: test-ssh
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Récupérer le dépôt
+        uses: actions/checkout@v4
 
       - name: Installer Ansible sur le runner
         shell: bash
@@ -283,44 +250,18 @@ jobs:
 
           sudo apt-get update
           sudo apt-get install -y ansible
-
-          echo "Version Ansible :"
           ansible --version
 
-      - name: Vérifier l'inventaire et le playbook Ansible
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          echo "Structure de l'inventaire :"
-          ansible-inventory \
-            -i ansible/inventory.ini \
-            --graph
-
-          echo
-          echo "Vérification syntaxique du playbook :"
-          ansible-playbook \
-            -i ansible/inventory.ini \
-            ansible/playbooks/install-package.yml \
-            --syntax-check
-
-      - name: Vérifier ssh-agent pour Ansible
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          [[ -n "${SSH_AUTH_SOCK:-}" ]] || {
-            echo "SSH_AUTH_SOCK est absent." >&2
-            exit 1
-          }
-
-          [[ -S "${SSH_AUTH_SOCK}" ]] || {
-            echo "Socket ssh-agent introuvable : ${SSH_AUTH_SOCK}" >&2
-            exit 1
-          }
-
-          echo "Clé disponible dans ssh-agent :"
-          ssh-add -l
+      - name: Préparer l'accès TUNSA
+        uses: ./.github/actions/setup-tunsa-access
+        with:
+          tailscale_client_id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          tailscale_oauth_secret: ${{ secrets.TS_OAUTH_SECRET }}
+          ssh_private_key: ${{ secrets.SSH_PRIVATE_KEY }}
+          ssh_key_passphrase: ${{ secrets.SSH_KEY_PASSPHRASE }}
+          ssh_known_hosts: ${{ secrets.SSH_KNOWN_HOSTS }}
+          node_1_ip: ${{ env.NODE_1_IP }}
+          node_2_ip: ${{ env.NODE_2_IP }}
 
       - name: Tester la connexion Ansible
         shell: bash
@@ -332,7 +273,7 @@ jobs:
 
           ansible \
             raspberry_nodes \
-            -i ansible/inventory.ini \
+            -i "${ANSIBLE_INVENTORY}" \
             --private-key "${HOME}/.ssh/tunsa_ansible" \
             -m ansible.builtin.ping
 
@@ -346,12 +287,12 @@ jobs:
 
           ansible \
             raspberry_nodes \
-            -i ansible/inventory.ini \
+            -i "${ANSIBLE_INVENTORY}" \
             --private-key "${HOME}/.ssh/tunsa_ansible" \
             -m ansible.builtin.command \
             -a "sudo -n id -u"
 
-      - name: Installer htop avec Ansible
+      - name: Installer le paquet avec Ansible
         shell: bash
         env:
           ANSIBLE_HOST_KEY_CHECKING: "True"
@@ -360,10 +301,10 @@ jobs:
           set -Eeuo pipefail
 
           ansible-playbook \
-            -i ansible/inventory.ini \
+            -i "${ANSIBLE_INVENTORY}" \
             --private-key "${HOME}/.ssh/tunsa_ansible" \
-            ansible/playbooks/install-package.yml \
-            --extra-vars "package_to_install=htop"
+            "${ANSIBLE_PLAYBOOK}" \
+            --extra-vars "package_to_install=${{ inputs.package_name }}"
 
       - name: Nettoyer SSH
         if: always()
@@ -372,10 +313,7 @@ jobs:
           set -Eeuo pipefail
 
           if [[ -n "${SSH_AGENT_PID:-}" ]]; then
-            echo "Arrêt de ssh-agent..."
             ssh-agent -k >/dev/null 2>&1 || true
-          else
-            echo "Aucun ssh-agent à arrêter."
           fi
 
           rm -f \
