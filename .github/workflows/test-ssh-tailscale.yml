@@ -34,7 +34,7 @@ jobs:
 
     steps:
       - name: Récupérer le dépôt
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Vérifier les fichiers requis
         shell: bash
@@ -87,7 +87,7 @@ jobs:
 
     steps:
       - name: Récupérer le dépôt
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Préparer l'accès TUNSA
         uses: ./.github/actions/setup-tunsa-access
@@ -241,7 +241,7 @@ jobs:
 
     steps:
       - name: Récupérer le dépôt
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Installer Ansible sur le runner
         shell: bash
